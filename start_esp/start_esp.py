@@ -44,6 +44,7 @@ from mako.template import Template
 
 # Location of NGINX binary
 NGINX = "/usr/sbin/nginx"
+NGINX_DEBUG = "/usr/sbin/nginx-debug"
 
 # Location of NGINX template
 NGINX_CONF_TEMPLATE = "/etc/nginx/nginx-auto.conf.template"
@@ -97,6 +98,16 @@ DEFAULT_WORKER_PROCESSES = "1"
 # Google default application credentials environment variable
 GOOGLE_CREDS_KEY = "GOOGLE_APPLICATION_CREDENTIALS"
 
+# Default access log location
+DEFAULT_ACCESS_LOG = "/dev/stdout"
+
+# Default client body buffer size
+DEFAULT_CLIENT_BODY_BUFFER_SIZE = "128k"
+
+# Default maxinum client body size
+DEFAULT_CLIENT_MAX_BODY_SIZE = "32m"
+
+
 Port = collections.namedtuple('Port',
         ['port', 'proto'])
 Location = collections.namedtuple('Location',
@@ -110,7 +121,7 @@ def write_pid_file(args):
         f.write(str(os.getpid()))
         f.close()
     except IOError as err:
-        logging.error("Failed to save PID file: " + args.pid_file)
+        logging.error("[ESP] Failed to save PID file: " + args.pid_file)
         logging.error(err.strerror)
         sys.exit(3)
 
@@ -119,7 +130,7 @@ def write_template(ingress, nginx_conf, args):
     try:
         template = Template(filename=args.template)
     except IOError as err:
-        logging.error("Failed to load NGINX config template. " + err.strerror)
+        logging.error("[ESP] Failed to load NGINX config template. " + err.strerror)
         sys.exit(3)
 
     conf = template.render(
@@ -136,6 +147,8 @@ def write_template(ingress, nginx_conf, args):
             underscores_in_headers=args.underscores_in_headers,
             allow_invalid_headers=args.allow_invalid_headers,
             enable_websocket=args.enable_websocket,
+            enable_debug=args.enable_debug,
+            enable_backend_routing=args.enable_backend_routing,
             client_max_body_size=args.client_max_body_size,
             client_body_buffer_size=args.client_body_buffer_size,
             worker_processes=args.worker_processes,
@@ -147,6 +160,8 @@ def write_template(ingress, nginx_conf, args):
             cors_allow_credentials=args.cors_allow_credentials,
             cors_expose_headers=args.cors_expose_headers,
             ssl_protocols=args.ssl_protocols,
+            experimental_proxy_backend_host_header=args.experimental_proxy_backend_host_header,
+            enable_strict_transport_security=args.enable_strict_transport_security,
             google_cloud_platform=(args.non_gcp==False))
 
     # Save nginx conf
@@ -155,7 +170,7 @@ def write_template(ingress, nginx_conf, args):
         f.write(conf)
         f.close()
     except IOError as err:
-        logging.error("Failed to save NGINX config." + err.strerror)
+        logging.error("[ESP] Failed to save NGINX config." + err.strerror)
         sys.exit(3)
 
 def write_server_config_template(server_config_path, args):
@@ -163,7 +178,7 @@ def write_server_config_template(server_config_path, args):
     try:
         template = Template(filename=args.server_config_template)
     except IOError as err:
-        logging.error("Failed to load server config template. " + err.strerror)
+        logging.error("[ESP] Failed to load server config template. " + err.strerror)
         sys.exit(3)
 
     for idx, service_configs in enumerate(args.service_config_sets):
@@ -179,6 +194,8 @@ def write_server_config_template(server_config_path, args):
                 rewrite_rules=args.rewrite,
                 disable_cloud_trace_auto_sampling=args.disable_cloud_trace_auto_sampling,
                 cloud_trace_url_override=args.cloud_trace_url_override,
+                log_request_headers=args.request_headers,
+                log_response_headers=args.response_headers,
                 metadata_attributes=args.metadata_attributes)
 
         server_config_file = server_config_path
@@ -191,7 +208,7 @@ def write_server_config_template(server_config_path, args):
             f.write(conf)
             f.close()
         except IOError as err:
-            logging.error("Failed to save server config." + err.strerror)
+            logging.error("[ESP] Failed to save server config." + err.strerror)
             sys.exit(3)
 
 def ensure(config_dir):
@@ -199,13 +216,13 @@ def ensure(config_dir):
         try:
             os.makedirs(config_dir)
         except OSError as exc:
-            logging.error("Cannot create config directory.")
+            logging.error("[ESP] Cannot create config directory.")
             sys.exit(3)
 
 
 def assert_file_exists(fl):
     if not os.path.exists(fl):
-        logging.error("Cannot find the specified file " + fl)
+        logging.error("[ESP] Cannot find the specified file " + fl)
         sys.exit(3)
 
 
@@ -214,7 +231,7 @@ def start_nginx(nginx, nginx_conf):
         # Control is relinquished to nginx process after this line
         os.execv(nginx, ['nginx', '-p', '/usr', '-c', nginx_conf])
     except OSError as err:
-        logging.error("Failed to launch NGINX: " + nginx)
+        logging.error("[ESP] Failed to launch NGINX: " + nginx)
         logging.error(err.strerror)
         sys.exit(3)
 
@@ -232,7 +249,7 @@ def fetch_and_save_service_config_url(config_dir, token, service_mgmt_url, filen
                       separators=(',', ': '))
             f.close()
         except IOError as err:
-            logging.error("Cannot save service config." + err.strerror)
+            logging.error("[ESP] Cannot save service config." + err.strerror)
             sys.exit(3)
 
     except fetch.FetchError as err:
@@ -267,6 +284,22 @@ def handle_xff_trusted_proxies(args):
             if proxy:
                 args.xff_trusted_proxies.append(proxy)
 
+# parse http headers list
+def handle_http_headers(args):
+    args.request_headers = []
+    if args.log_request_headers is not None:
+        for header in args.log_request_headers.split(","):
+            header = header.strip()
+            if header:
+                args.request_headers.append(header)
+
+    args.response_headers = []
+    if args.log_response_headers is not None:
+        for header in args.log_response_headers.split(","):
+            header = header.strip()
+            if header:
+                args.response_headers.append(header)
+
 def fetch_service_config(args):
     args.service_config_sets = []
     args.rollout_ids = []
@@ -274,7 +307,7 @@ def fetch_service_config(args):
     try:
         # Check service_account_key and non_gcp
         if args.non_gcp and args.service_account_key is None:
-            logging.error("If --non_gcp is specified, --service_account_key has to be specified");
+            logging.error("[ESP] If --non_gcp is specified, --service_account_key has to be specified");
             sys.exit(3)
 
         # Get the access token
@@ -301,9 +334,9 @@ def fetch_service_config(args):
             # if service name is not specified, display error message and exit
             if args.service is None:
                 if args.check_metadata:
-                    logging.error("Unable to fetch service name from the metadata service");
+                    logging.error("[ESP] Unable to fetch service name from the metadata service");
                 else:
-                    logging.error("Service name is not specified");
+                    logging.error("[ESP] Service name is not specified");
                 sys.exit(3)
 
             # fetch service config rollout strategy from metadata, if not specified
@@ -370,7 +403,7 @@ def make_ingress(args):
     if len(collisions) > 0:
         shared_port, count = collisions.most_common(1)[0]
         if count > 1:
-            logging.error("Port " + str(shared_port) + " is used more than once.")
+            logging.error("[ESP] Port " + str(shared_port) + " is used more than once.")
             sys.exit(2)
 
     if args.http_port is not None:
@@ -517,6 +550,10 @@ config file.'''.format(
         header, Default value: {xff_trusted_proxy_list}'''.
         format(xff_trusted_proxy_list=DEFAULT_XFF_TRUSTED_PROXY_LIST))
 
+    parser.add_argument('--experimental_proxy_backend_host_header', default=None,
+        help='''Define the Host header value that overrides the incoming Host
+        header for upstream request.''')
+
     parser.add_argument('--check_metadata', action='store_true',
         help='''Enable fetching access token, service name, service config ID
         and rollout strategy from the metadata service''')
@@ -536,6 +573,14 @@ config file.'''.format(
         help='''Enable nginx WebSocket support.
         ''')
 
+    parser.add_argument('--enable_strict_transport_security', action='store_true',
+        help='''Enable HSTS (HTTP Strict Transport Security).
+        ''')
+
+    parser.add_argument('--enable_debug', action='store_true',
+        help='''Run debug Nginx binary with debug trace.
+        ''')
+
     parser.add_argument('--generate_self_signed_cert', action='store_true',
         help='''Generate a self-signed certificate and key at start, then
         store them in /etc/nginx/ssl/nginx.crt and /etc/nginx/ssl/nginx.key.
@@ -544,7 +589,7 @@ config file.'''.format(
         "localhost" and valid for 10 years.
         ''')
 
-    parser.add_argument('--client_max_body_size', default='32m', help='''
+    parser.add_argument('--client_max_body_size', default=DEFAULT_CLIENT_MAX_BODY_SIZE, help='''
     Sets the maximum allowed size of the client request body, specified
     in the "Content-Length" request header field. If the size in a request
     exceeds the configured value, the 413 (Request Entity Too Large) error
@@ -552,7 +597,7 @@ config file.'''.format(
     display this error. Setting size to 0 disables checking of client request
     body size.''')
 
-    parser.add_argument('--client_body_buffer_size', default='128k', help='''
+    parser.add_argument('--client_body_buffer_size', default=DEFAULT_CLIENT_BODY_BUFFER_SIZE, help='''
     Sets buffer size for reading client request body. In case the request
     body is larger than the buffer, the whole body or only its part is
     written to a temporary file.''')
@@ -618,10 +663,14 @@ config file.'''.format(
         default=SERVER_CONF_TEMPLATE,
         help=argparse.SUPPRESS)
 
-
     # nginx binary location
     parser.add_argument('--nginx',
         default=NGINX,
+        help=argparse.SUPPRESS)
+
+    # nginx_debug binary location
+    parser.add_argument('--nginx_debug',
+        default=NGINX_DEBUG,
         help=argparse.SUPPRESS)
 
     # Address of the DNS resolver used by nginx http.cc
@@ -631,7 +680,7 @@ config file.'''.format(
 
     # Access log destination. Use special value 'off' to disable.
     parser.add_argument('--access_log',
-        default='/dev/stdout',
+        default=DEFAULT_ACCESS_LOG,
         help=argparse.SUPPRESS)
 
     # PID file location.
@@ -736,22 +785,22 @@ config file.'''.format(
         SSL protocols (e.g., --ssl_protocols=TLSv1.1 --ssl_protocols=TLSv1.2).
         ''')
     parser.add_argument('--generate_config_file_only', action='store_true',
-        help='''Only generate the nginx config file without running ESP. This option is 
+        help='''Only generate the nginx config file without running ESP. This option is
         for testing that the generated nginx config file is as expected.
         ''')
     parser.add_argument('--server_config_generation_path',
         default=None, help='''
         Define where to write the server configuration file(s). For a single server
-        configuration file, this must be a file name. 
+        configuration file, this must be a file name.
         When --experimental_enable_multiple_api_configs is enabled, to write multiple server
-        configuration files, this must be a directory path that ends with a '/'. 
+        configuration files, this must be a directory path that ends with a '/'.
         When --generate_config_file_only is used but
         --server_config_generation_path is absent, the server configuration file generation
         is skipped.
         ''')
     parser.add_argument('--experimental_enable_multiple_api_configs', action='store_true',
                         help='''
-        Enable an experimental feature that proxies multiple Endpoints services. 
+        Enable an experimental feature that proxies multiple Endpoints services.
         By default, this feature is disabled.
         ''')
 
@@ -760,28 +809,126 @@ config file.'''.format(
         default=None,
         help=argparse.SUPPRESS)
 
+    parser.add_argument('--log_request_headers', default=None, help='''
+        Log corresponding request headers into Google cloud console through
+        service control, separated by comma. Example, when
+        --log_request_headers=foo,bar, endpoint log will have
+        request_headers: foo=foo_value;bar=bar_value if values are available;
+        ''')
+
+    parser.add_argument('--log_response_headers', default=None, help='''
+        Log corresponding response headers into Google cloud console through
+        service control, separated by comma. Example, when
+        --log_response_headers=foo,bar, endpoint log will have
+        response_headers: foo=foo_value;bar=bar_value if values are available;
+        ''')
+
+    parser.add_argument('--enable_backend_routing',
+        action='store_true', help='''
+        Enables the nginx proxy to route requests according to the `x-google-backend` or
+        `backend` configuration. This flag conflicts with a few of other flags.
+        ''')
+
     return parser
 
+# Check whether there are conflict flags. If so, return the error string. Otherwise returns None.
+# This function also changes some default flag value.
+def enforce_conflict_args(args):
+    if args.generate_config_file_only:
+        # this is for test purpose.
+        if args.server_config_generation_path:
+            return None
+        if args.nginx_config:
+            return "--nginx_config is not allowed when --generate_config_file_only"
+
+    if args.enable_backend_routing:
+        if args.cloud_trace_url_override:
+            return "Flag --enable_backend_routing cannot be used together with --cloud_trace_url_override."
+        if args.experimental_enable_multiple_api_configs:
+            return "Flag --enable_backend_routing cannot be used together with --experimental_enable_multiple_api_configs."
+        if args.disable_cloud_trace_auto_sampling:
+            return "Flag --enable_backend_routing cannot be used together with --disable_cloud_trace_auto_sampling."
+        if args.non_gcp:
+            return "Flag --enable_backend_routing cannot be used together with --non_gcp."
+        if args.transcoding_always_print_primitive_fields:
+            return "Flag --enable_backend_routing cannot be used together with --transcoding_always_print_primitive_fields."
+        if args.pid_file != DEFAULT_PID_FILE:
+            return "Flag --enable_backend_routing cannot be used together with --pid_file."
+        if args.access_log != DEFAULT_ACCESS_LOG:
+            return "Flag --enable_backend_routing cannot be used together with --access_log."
+        if args.nginx_debug != NGINX_DEBUG:
+            return "Flag --enable_backend_routing cannot be used together with --nginx_debug."
+        if args.nginx != NGINX:
+            return "Flag --enable_backend_routing cannot be used together with --nginx."
+        if args.server_config_template != SERVER_CONF_TEMPLATE:
+            return "Flag --enable_backend_routing cannot be used together with --server_config_template."
+        if args.template != NGINX_CONF_TEMPLATE:
+            return "Flag --enable_backend_routing cannot be used together with --template."
+        if args.config_dir != CONFIG_DIR:
+            return "Flag --enable_backend_routing cannot be used together with --config_dir."
+        if args.service_control_url_override:
+            return "Flag --enable_backend_routing cannot be used together with --service_control_url_override."
+        if args.metadata != METADATA_ADDRESS:
+            return "Flag --enable_backend_routing cannot be used together with --metadata."
+        if args.service_json_path:
+            return "Flag --enable_backend_routing cannot be used together with --service_json_path."
+        if args.worker_processes != DEFAULT_WORKER_PROCESSES:
+            return "Flag --enable_backend_routing cannot be used together with --worker_processes."
+        if args.rewrite:
+            return "Flag --enable_backend_routing cannot be used together with --rewrite."
+        if args.client_body_buffer_size != DEFAULT_CLIENT_BODY_BUFFER_SIZE:
+            return "Flag --enable_backend_routing cannot be used together with --client_body_buffer_size."
+        if args.client_max_body_size != DEFAULT_CLIENT_MAX_BODY_SIZE:
+            return "Flag --enable_backend_routing cannot be used together with --client_max_body_size."
+        if args.generate_self_signed_cert:
+            return "Flag --enable_backend_routing cannot be used together with --generate_self_signed_cert."
+        if args.enable_strict_transport_security:
+            return "Flag --enable_backend_routing cannot be used together with --enable_strict_transport_security."
+        if args.enable_websocket:
+            return "Flag --enable_backend_routing cannot be used together with --enable_websocket."
+        if args.allow_invalid_headers:
+            return "Flag --enable_backend_routing cannot be used together with --allow_invalid_headers."
+        if args.underscores_in_headers:
+            return "Flag --enable_backend_routing cannot be used together with --underscores_in_headers."
+        if args.experimental_proxy_backend_host_header:
+            return "Flag --enable_backend_routing cannot be used together with --experimental_proxy_backend_host_header."
+        if args.xff_trusted_proxy_list != DEFAULT_XFF_TRUSTED_PROXY_LIST:
+            return "Flag --enable_backend_routing cannot be used together with -x or --xff_trusted_proxy_list."
+        if args.healthz:
+            return "Flag --enable_backend_routing cannot be used together with -z or --healthz."
+        if args.tls_mutual_auth:
+            return "Flag --enable_backend_routing cannot be used together with -t or --tls_mutual_auth."
+        if args.backend != DEFAULT_BACKEND:
+            return "Flag --enable_backend_routing cannot be used together with -a or --backend."
+        if args.status_port != DEFAULT_STATUS_PORT:
+            return "Flag --enable_backend_routing cannot be used together with -N or --status_port."
+        if args.nginx_config:
+            return "Flag --enable_backend_routing cannot be used together with -n or --nginx_config."
+
+        # When --enable_backend_routing is specified, set some default value to some of its conflicting flags.
+        args.disable_cloud_trace_auto_sampling = True
+        args.access_log = 'off'
+    return None
 
 if __name__ == '__main__':
     parser = make_argparser()
     args = parser.parse_args()
     logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.INFO)
 
-    if args.generate_config_file_only:
-        if args.nginx_config:
-            logging.error("--nginx_config is not allowed when --generate_config_file_only")
-            sys.exit(3)
+    check_conflict_result = enforce_conflict_args(args)
+    if check_conflict_result:
+        logging.error(check_conflict_result)
+        sys.exit(3)
 
     if args.service and '|' in args.service:
         if args.experimental_enable_multiple_api_configs == False:
-            logging.error("The flag --experimental_enable_multiple_api_configs must be enabled when --service specifies multiple services")
+            logging.error("[ESP] The flag --experimental_enable_multiple_api_configs must be enabled when --service specifies multiple services")
             sys.exit(3)
         if args.version:
-            logging.error("--version is not allowed when --service specifies multiple services")
+            logging.error("[ESP] --version is not allowed when --service specifies multiple services")
             sys.exit(3)
         if args.server_config_generation_path and not args.server_config_generation_path.endswith('/'):
-            logging.error("--server_config_generation_path must end with / when --service specifies multiple services")
+            logging.error("[ESP] --server_config_generation_path must end with / when --service specifies multiple services")
             sys.exit(3)
 
     # Set credentials file from the environment variable
@@ -794,6 +941,9 @@ if __name__ == '__main__':
 
     # Handles IP addresses of trusted proxies
     handle_xff_trusted_proxies(args)
+
+    # Handles http headers
+    handle_http_headers(args)
 
     # Get service config
     if args.service_json_path:
@@ -809,8 +959,12 @@ if __name__ == '__main__':
     # Generate server_config
     args.metadata_attributes = fetch.fetch_metadata_attributes(args.metadata)
     if args.generate_config_file_only:
+        # When generate_config_file_only, metadata_attributes is set as empty
+        # to have consistent test results on local bazel test and jenkins test
+        # environments.
+        args.metadata_attributes = None
         if args.server_config_generation_path is None:
-            logging.error("when --generate_config_file_only, must specify --server_config_generation_path")
+            logging.error("[ESP] when --generate_config_file_only, must specify --server_config_generation_path")
             sys.exit(3)
         else:
             write_server_config_template(args.server_config_generation_path, args)
@@ -844,4 +998,7 @@ if __name__ == '__main__':
                    ' -days 3650 -subj "/CN=localhost"'))
 
     # Start NGINX
-    start_nginx(args.nginx, nginx_conf)
+    nginx_bin = args.nginx
+    if args.enable_debug:
+      nginx_bin = args.nginx_debug
+    start_nginx(nginx_bin, nginx_conf)

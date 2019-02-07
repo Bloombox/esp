@@ -41,7 +41,9 @@ class TestStartEsp(unittest.TestCase):
     server_conf_template = "./start_esp/test/server-conf-template"
     generated_nginx_config_file = "./start_esp/test/nginx.conf"
     generated_server_config_file = "./start_esp/test/generated_server_configuration.json"
+    empty_flag_config_generator = "./start_esp/test/start_esp_binary --generate_config_file_only --server_config_generation_path ./start_esp/test/generated_server_configuration.json"
     basic_config_generator = "./start_esp/test/start_esp_binary --generate_config_file_only --pid_file ./start_esp/test/pid_file --service_account_key key --config_dir ./start_esp/test --template ./start_esp/test/nginx-conf-template --server_config_template ./start_esp/test/server-conf-template --service_json_path ./start_esp/test/testdata/test_service_config_1.json --server_config_generation_path ./start_esp/test/generated_server_configuration.json"
+    backend_routing_config_generator = "./start_esp/test/start_esp_binary --enable_backend_routing --generate_config_file_only --pid_file ./start_esp/test/pid_file --service_account_key key --config_dir ./start_esp/test --template ./start_esp/test/nginx-conf-template --server_config_template ./start_esp/test/server-conf-template --service_json_path ./start_esp/test/testdata/test_service_config_1.json --server_config_generation_path ./start_esp/test/generated_server_configuration.json"
 
     @staticmethod
     def file_equal(path1, path2):
@@ -129,6 +131,11 @@ class TestStartEsp(unittest.TestCase):
         config_generator = self.basic_config_generator + " --enable_websocket"
         self.run_test_with_expectation(expected_config_file, self.generated_nginx_config_file, config_generator)
 
+    def test_enable_debug_arg_output_is_as_expected(self):
+        expected_config_file = "./start_esp/test/testdata/expected_enable_debug_nginx.conf"
+        config_generator = self.basic_config_generator + " --enable_debug"
+        self.run_test_with_expectation(expected_config_file, self.generated_nginx_config_file, config_generator)
+
     def test_client_max_body_size_arg_output_is_as_expected(self):
         expected_config_file = "./start_esp/test/testdata/expected_client_max_body_size_nginx.conf"
         config_generator = self.basic_config_generator + " --client_max_body_size 10m"
@@ -194,6 +201,16 @@ class TestStartEsp(unittest.TestCase):
         config_generator = self.basic_config_generator + " --cors_preset cors_with_regex --cors_allow_origin_regex test_cors_regex"
         self.run_test_with_expectation(expected_config_file, self.generated_nginx_config_file, config_generator)
 
+    def test_backend_host_header_expected(self):
+        expected_config_file = "./start_esp/test/testdata/expected_backend_host_header_nginx.conf"
+        config_generator = self.basic_config_generator + " --experimental_proxy_backend_host_header your.backend.host"
+        self.run_test_with_expectation(expected_config_file, self.generated_nginx_config_file, config_generator)
+
+    def test_enable_strict_transport_security_is_as_expected(self):
+        expected_config_file = "./start_esp/test/testdata/expected_enable_strict_transport_security_nginx.conf"
+        config_generator = self.basic_config_generator + " --enable_strict_transport_security"
+        self.run_test_with_expectation(expected_config_file, self.generated_nginx_config_file, config_generator)
+
     ########## The tests for generating the server configuration file start from here ##########
 
     def test_service_control_url_override_arg_output_is_as_expected(self):
@@ -240,6 +257,33 @@ class TestStartEsp(unittest.TestCase):
         expected_config_file = "./start_esp/test/testdata/expected_cloud_trace_url_override_server.json"
         config_generator = self.basic_config_generator + " --cloud_trace_url_override test_cloud_trace_url_override"
         self.run_test_with_expectation(expected_config_file, self.generated_server_config_file, config_generator)
+
+    def test_service_control_report_http_headers_arg_output_is_as_expected(self):
+        expected_config_file = "./start_esp/test/testdata/expected_service_control_report_http_headers.json"
+        config_generator = self.basic_config_generator + " --log_request_headers foo,bar --log_response_headers foo"
+        self.run_test_with_expectation(expected_config_file, self.generated_server_config_file, config_generator)
+
+    def test_backend_routing_output_is_as_expected(self):
+        expected_config_file = "./start_esp/test/testdata/expected_backend_routing_nginx.conf"
+        config_generator = self.backend_routing_config_generator
+        self.run_test_with_expectation(expected_config_file, self.generated_nginx_config_file, config_generator)
+
+    ########## The tests for validating it should generate failure on conflict flags ##########
+
+    def test_enable_backend_routing_conflicts_with_string_flag(self):
+        config_generator = self.empty_flag_config_generator + " --enable_backend_routing --pid_file fake_value"
+        return_code = os.system(config_generator)
+        self.assertEqual(return_code >> 8, 3)
+
+    def test_enable_backend_routing_conflicts_with_boolean_flag(self):
+        config_generator = self.empty_flag_config_generator + " --enable_backend_routing --non_gcp"
+        return_code = os.system(config_generator)
+        self.assertEqual(return_code >> 8, 3)
+
+    def test_enable_backend_routing_conflicts_with_single_dash_flag(self):
+        config_generator = self.empty_flag_config_generator + " --enable_backend_routing -z fake_value"
+        return_code = os.system(config_generator)
+        self.assertEqual(return_code >> 8, 3)
 
 if __name__ == '__main__':
     unittest.main()

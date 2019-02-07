@@ -16,11 +16,16 @@
 //
 
 #include "src/api_manager/context/request_context.h"
+#include "google/api/backend.pb.h"
+#include "google/protobuf/stubs/strutil.h"
 
 #include <uuid/uuid.h>
+#include <numeric>
 #include <sstream>
+#include <vector>
 
 using ::google::api_manager::utils::Status;
+using ::google::api_manager::cloud_trace::HeaderType;
 
 namespace google {
 namespace api_manager {
@@ -30,6 +35,13 @@ namespace {
 
 // Cloud Trace Context Header
 const char kCloudTraceContextHeader[] = "X-Cloud-Trace-Context";
+// gRPC Trace Context Header
+const char kGRpcTraceContextHeader[] = "grpc-trace-bin";
+
+// Authorization Header
+const char kAuthorizationHeader[] = "Authorization";
+
+const char kBearerPrefix[] = "Bearer ";
 
 // HTTP Method Override Header
 const char kHttpMethodOverrideHeader[] = "X-HTTP-Method-Override";
@@ -122,7 +134,8 @@ RequestContext::RequestContext(std::shared_ptr<ServiceContext> service_context,
   method_call_ =
       service_context_->GetMethodCallInfo(method, path, query_params);
 
-  if (method_call_.method_info) {
+  if (method_call_.method_info &&
+      !method_call_.method_info->allow_unregistered_calls()) {
     ExtractApiKey();
   }
   request_->FindHeader("referer", &http_referer_);
@@ -131,7 +144,15 @@ RequestContext::RequestContext(std::shared_ptr<ServiceContext> service_context,
   // set.
   if (service_context_->cloud_trace_aggregator()) {
     std::string trace_context_header;
-    request_->FindHeader(kCloudTraceContextHeader, &trace_context_header);
+    // Default to CLOUD_TRACE_CONTEXT to not change the default behavior.
+    HeaderType header_type = HeaderType::CLOUD_TRACE_CONTEXT;
+    if (request_->FindHeader(kGRpcTraceContextHeader, &trace_context_header)) {
+      // gRPC trace header found, the type of the header should be
+      // GRPC_TRACE_CONTEXT
+      header_type = HeaderType::GRPC_TRACE_CONTEXT;
+    } else {
+      request_->FindHeader(kCloudTraceContextHeader, &trace_context_header);
+    }
 
     std::string method_name = kUnrecognizedOperation;
     if (method_call_.method_info) {
@@ -140,7 +161,7 @@ RequestContext::RequestContext(std::shared_ptr<ServiceContext> service_context,
     // qualify with the service name
     method_name = service_context_->service_name() + "/" + method_name;
     cloud_trace_.reset(cloud_trace::CreateCloudTrace(
-        trace_context_header, method_name,
+        trace_context_header, method_name, header_type,
         &service_context_->cloud_trace_aggregator()->sampler()));
   }
 }
@@ -245,6 +266,32 @@ void RequestContext::FillLogMessage(service_control::ReportRequestInfo *info) {
   }
 }
 
+void RequestContext::FillHttpHeaders(const Response *response,
+                                     service_control::ReportRequestInfo *info) {
+  auto serverConfig = service_context_->config()->server_config();
+  if (serverConfig->has_service_control_config()) {
+    const auto &request_headers =
+        serverConfig->service_control_config().log_request_header();
+    for (const auto &header : request_headers) {
+      std::string header_value;
+      if (request_->FindHeader(header, &header_value)) {
+        info->request_headers =
+            info->request_headers + header + "=" + header_value + ";";
+      }
+    }
+
+    const auto &response_headers =
+        serverConfig->service_control_config().log_response_header();
+    for (const auto &header : response_headers) {
+      std::string header_value;
+      if (response->FindHeader(header, &header_value)) {
+        info->response_headers =
+            info->response_headers + header + "=" + header_value + ";";
+      }
+    }
+  }
+}
+
 void RequestContext::FillCheckRequestInfo(
     service_control::CheckRequestInfo *info) {
   FillOperationInfo(info);
@@ -314,6 +361,7 @@ void RequestContext::FillReportRequestInfo(
 
     // Must be after response_code and method are assigned.
     FillLogMessage(info);
+    FillHttpHeaders(response, info);
     bool is_streaming = false;
     if (method() &&
         (method()->request_streaming() || method()->response_streaming())) {
@@ -357,14 +405,18 @@ const std::string RequestContext::FindClientIPAddress() {
 void RequestContext::StartBackendSpanAndSetTraceContext() {
   backend_span_.reset(CreateSpan(cloud_trace_.get(), "Backend"));
 
-  // Set trace context header to backend. The span id in the header will
-  // be the backend span's id.
-  std::ostringstream trace_context_stream;
-  trace_context_stream << cloud_trace()->trace()->trace_id() << "/"
-                       << backend_span_->trace_span()->span_id() << ";"
-                       << cloud_trace()->options();
-  Status status = request()->AddHeaderToBackend(kCloudTraceContextHeader,
-                                                trace_context_stream.str());
+  // TODO: A better logic would be to send for GRPC backends the grpc-trace-bin
+  // header, and for http/https backends the X-Cloud-Trace-Context header.
+
+  std::string trace_context_header = cloud_trace()->ToTraceContextHeader(
+      backend_span_->trace_span()->span_id());
+
+  // Set trace context header to backend.
+  Status status = request()->AddHeaderToBackend(
+      cloud_trace()->header_type() == HeaderType::CLOUD_TRACE_CONTEXT
+          ? kCloudTraceContextHeader
+          : kGRpcTraceContextHeader,
+      trace_context_header);
   if (!status.ok()) {
     service_context()->env()->LogError(
         "Failed to set trace context header to backend.");
@@ -379,6 +431,76 @@ std::string RequestContext::GetAuthorizationUrl() const {
     return method_call_.method_info->first_authorization_url();
   } else {
     return method_call_.method_info->authorization_url_by_issuer(auth_issuer_);
+  }
+}
+
+std::string RequestContext::GetBackendPath() const {
+  if (method_call_.method_info == nullptr) {
+    return "";
+  }
+
+  if (method_call_.method_info->backend_path_translation() ==
+      ::google::api::BackendRule_PathTranslation_APPEND_PATH_TO_ADDRESS) {
+    return "";
+  } else if (method_call_.method_info->backend_path_translation() ==
+             ::google::api::BackendRule_PathTranslation_CONSTANT_ADDRESS) {
+    std::string parameters;
+    for (std::size_t i = 0; i != method_call_.variable_bindings.size(); i++) {
+      auto &variable_binding = method_call_.variable_bindings[i];
+      if (variable_binding.field_path.size() == 1) {
+        parameters += variable_binding.field_path[0];
+      } else if (variable_binding.field_path.size() > 1) {
+        parameters = std::accumulate(variable_binding.field_path.begin(),
+                                     variable_binding.field_path.end(),
+                                     std::string("."));
+      }
+      parameters.append("=");
+      parameters.append(variable_binding.value);
+      if (i != method_call_.variable_bindings.size() - 1) {
+        parameters.append("&");
+      }
+    }
+
+    if (parameters != "") {
+      return method_call_.method_info->backend_path() + "?" + parameters;
+    }
+    return method_call_.method_info->backend_path();
+  } else {
+    return "";
+  }
+}
+
+bool RequestContext::ShouldOverrideBackend() const {
+  if (method_call_.method_info == nullptr) {
+    return false;
+  }
+
+  if (method_call_.method_info->backend_path_translation() ==
+      ::google::api::BackendRule_PathTranslation_PATH_TRANSLATION_UNSPECIFIED) {
+    return false;
+  }
+  return true;
+}
+
+void RequestContext::AddInstanceIdentityToken() {
+  if (!method()) {
+    return;
+  }
+
+  const auto &audience = method()->backend_jwt_audience();
+  if (!audience.empty()) {
+    auto &token = service_context()
+                      ->global_context()
+                      ->GetInstanceIdentityToken(audience)
+                      ->GetAuthToken();
+    if (!token.empty()) {
+      Status status = request()->AddHeaderToBackend(kAuthorizationHeader,
+                                                    kBearerPrefix + token);
+      if (!status.ok()) {
+        service_context()->env()->LogError(
+            "Failed to set authorization header to backend.");
+      }
+    }
   }
 }
 

@@ -99,6 +99,10 @@ class RequestContext {
   // backend.
   void StartBackendSpanAndSetTraceContext();
 
+  // Add the instance identity token to request header.
+  // This is required for backend routing, where esp is used as API gateway.
+  void AddInstanceIdentityToken();
+
   // Marks the end of backend trace span.
   void EndBackendSpan() { backend_span_.reset(); }
 
@@ -132,6 +136,14 @@ class RequestContext {
   // Return the authorization url.
   std::string GetAuthorizationUrl() const;
 
+  // Get the backend uri based on BackendRule from service config.
+  // For more information, refer to
+  // https://github.com/googleapis/googleapis/blob/master/google/api/backend.proto#L41
+  std::string GetBackendPath() const;
+
+  // Get whether needs to override the backend or not.
+  bool ShouldOverrideBackend() const;
+
   // Set auth token to RuqestContext.
   void SetAuthToken(const std::string &token) { auth_token_ = token; }
 
@@ -150,6 +162,10 @@ class RequestContext {
 
   // Fill log message.
   void FillLogMessage(service_control::ReportRequestInfo *info);
+
+  // Fill HTTP headers.
+  void FillHttpHeaders(const Response *response,
+                       service_control::ReportRequestInfo *info);
 
   // Extracts api-key
   void ExtractApiKey();
